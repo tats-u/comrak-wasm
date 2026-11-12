@@ -55,6 +55,11 @@ export function collectOptions(options?: Options): [
     },
   } satisfies Options;
 
+  opts.extension.headerIdPrefix =
+    options?.extension?.headerIdPrefix !== undefined
+      ? options.extension.headerIdPrefix
+      : options?.extension?.headerIDs ?? opts.extension.headerIdPrefix;
+
   let { brokenLinkCallback = null } = opts.parse;
   if (brokenLinkCallback && typeof brokenLinkCallback !== "function") {
     if (
@@ -130,6 +135,11 @@ export function collectOptions(options?: Options): [
       headingAdapter = null;
     }
   }
+
+  // Functions are collected separately by Rust and skipped by option serde.
+  Object.assign(opts, {
+    plugins: { render: { codefenceRenderers: render?.codefenceRenderers } },
+  });
 
   return [
     opts,

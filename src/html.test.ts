@@ -100,7 +100,7 @@ describe("markdownToHTML", () => {
       });
       t.assert.strictEqual(
         html,
-        `<h1><a href="#readme" aria-hidden="true" class="anchor" id="user-content-readme"></a>README</h1>\n`,
+        `<h1 id="user-content-readme">README<a href="#readme" aria-label="Link to heading 'README'" data-heading-content="README" class="anchor"></a></h1>\n`,
       );
     });
 

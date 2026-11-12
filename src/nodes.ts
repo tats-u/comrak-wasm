@@ -93,11 +93,17 @@ export declare namespace AST {
   export interface NodeData<T extends string = string, V = never> {
     value: Resolve<T, V>;
     sourcepos: Sourcepos | undefined;
+    /** Legacy block content; empty after parsing on current Comrak. */
     content: string;
+    /** Legacy offsets; current Comrak may release them after parsing. */
+    line_offsets: number[];
+    attrs?: Attributes | null;
+    lines?: { content: string; offsets: number[] } | null;
+    /** Source span of a task checkbox symbol, when present. */
+    task_item_sourcepos?: Sourcepos;
     open: boolean;
     table_visited: boolean;
     last_line_blank: boolean;
-    line_offsets: number[];
   }
 
   /**
@@ -126,7 +132,9 @@ export declare namespace AST {
 
   export interface Code {
     literal: string;
+    /** @deprecated Inline code has no info string; retained as an empty string. */
     info: string;
+    num_backticks?: number;
   }
   export type CodeData = NodeData<"Code", Code>;
   export type CodeNode = Node<CodeData>;
@@ -320,6 +328,7 @@ export declare namespace AST {
 
   export interface WikiLink {
     url: string;
+    embed?: boolean;
   }
   export type WikiLinkData = NodeData<"WikiLink", WikiLink>;
   export type WikiLinkNode = Node<WikiLinkData>;
@@ -363,6 +372,46 @@ export declare namespace AST {
    * @see {@linkcode renderCommonMark} to render an AST to a CommonMark document.
    * @category Parsing
    */
+  export interface Attributes {
+    id: string | null;
+    classes: string[];
+    pairs: [string, string][];
+  }
+  export interface Callout {
+    callout_type: string;
+    metadata: string | null;
+    fold: "None" | "Expanded" | "Collapsed";
+  }
+  export type CalloutNode = Node<NodeData<"Callout", Callout>>;
+  export type CalloutTitleNode = Node<NodeData<"CalloutTitle">>;
+  export type InsertNode = Node<NodeData<"Insert">>;
+  export type HighlightNode = Node<NodeData<"Highlight">>;
+  export type BlockDirectiveNode = Node<
+    NodeData<"BlockDirective", {
+      fence_length: number;
+      fence_offset: number;
+      info: string;
+    }>
+  >;
+  export type CommentInlineNode = Node<
+    NodeData<"CommentInline", { literal: string }>
+  >;
+  export type MultilineCommentNode = Node<
+    NodeData<"MultilineComment", {
+      literal: string;
+      closed: boolean;
+    }>
+  >;
+  export type HeexInlineNode = Node<NodeData<"HeexInline", string>>;
+  export type HeexBlockNode = Node<
+    NodeData<"HeexBlock", {
+      literal: string;
+      node: "Directive" | "Comment" | "MultilineComment" | "Expression" | {
+        Tag: string;
+      };
+    }>
+  >;
+
   export type NodeType =
     | DocumentNode
     | TextNode
@@ -406,7 +455,16 @@ export declare namespace AST {
     | SpoileredTextNode
     | EscapedTagNode
     | AlertNode
-    | SubtextNode;
+    | SubtextNode
+    | CalloutNode
+    | CalloutTitleNode
+    | InsertNode
+    | HighlightNode
+    | BlockDirectiveNode
+    | CommentInlineNode
+    | MultilineCommentNode
+    | HeexInlineNode
+    | HeexBlockNode;
 }
 
 /**

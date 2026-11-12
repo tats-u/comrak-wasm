@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/comrak-wasm", "crates/comrak-labs"]
+members = ["crates/comrak-wasm", "crates/comrak"]
 resolver = "2"
 
 [workspace.package]
-version = "0.48.0"
+version = "0.59.0"
 authors = ["Nicholas Berlette <nick@berlette.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -16,11 +16,13 @@ categories = ["parsing", "text-processing", "wasm"]
 publish = false
 
 [workspace.dependencies]
-comrak = { path = "crates/comrak-labs", version = "=0.48.0", features = [
+comrak = { path = "crates/comrak", version = "=0.59.0", features = [
   "shortcodes",
   "serialization",
+  "attributes",
+  "phoenix_heex",
 ], default-features = false }
-js-sys = { version = "=0.3.77" }
+js-sys = { version = "=0.3.85" }
 serde = { version = "=1.0.228", default-features = false, features = [
   "derive",
   "rc",
@@ -31,7 +33,7 @@ serde_json = { version = "=1.0.145", default-features = false, features = [
   "preserve_order",
   "raw_value",
 ] }
-wasm-bindgen = { version = "=0.2.100", default-features = false, features = [
+wasm-bindgen = { version = "=0.2.108", default-features = false, features = [
   "strict-macro",
   "enable-interning",
 ] }

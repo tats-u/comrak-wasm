@@ -2,107 +2,6 @@
 // deno-lint-ignore-file
 // deno-fmt-ignore-file
 
-export function default_options(): object;
-/**
- * r" Render Markdown to CommonMark.
- * r" See the documentation of the crate root for an example.
- */
-export function markdown_to_commonmark(
-  md: string,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-/**
- * Returns the version of Comrak used in this build, as a string.
- */
-export function version(): string;
-export function default_render_options(): object;
-/**
- * r" Format an AST to XML using plugins.
- * r"
- * r" See the documentation of the crate root for an example.
- */
-export function format_xml(
-  ast: AST,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-/**
- * r" Render Markdown to HTML using plugins.
- * r" See the documentation of the crate root for an example.
- */
-export function markdown_to_html(
-  md: string,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-/**
- * r" Format an AST to HTML using plugins.
- * r"
- * r" See the documentation of the crate root for an example.
- */
-export function format_html(
-  ast: AST,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-/**
- * r" Format an AST to CommonMark using plugins.
- * r"
- * r" See the documentation of the crate root for an example.
- */
-export function format_commonmark(
-  ast: AST,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-/**
- * Parses the given markdown text and returns the AST as a structured object.
- */
-export function parse_document(
-  md: string,
-  options: Option<Options>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): AST;
-/**
- * r" Render Markdown to XML using plugins.
- * r"
- * r" See the documentation of the crate root for an example.
- */
-export function markdown_to_xml(
-  md: string,
-  options: Option<Options>,
-  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
-  heading_adapter: Option<HeadingAdapter>,
-  broken_link_callback: Option<BrokenLinkCallbackFunction>,
-  image_url_rewriter: Option<URLRewriterFunction>,
-  link_url_rewriter: Option<URLRewriterFunction>,
-): string;
-export function default_extension_options(): object;
-export function default_parse_options(): object;
-
 import type {
   BrokenLinkCallbackFunction,
   BrokenLinkReference,
@@ -131,6 +30,7 @@ export type Option<T> = T | null | undefined;
  * The `BrokenLinkCallback` API allows you to handle broken links found by
  * Comrak while parsing a Markdown document. You can leverage this API via the
  * {@linkcode Options.parse.brokenLinkCallback} option.
+ *
  * It exposes its inner `resolve` function as well as a `call` method to
  * invoke it directly, which is rarely used outside of testing and other
  * advanced use cases. The `call` signature mirrors that of the native
@@ -139,11 +39,13 @@ export type Option<T> = T | null | undefined;
  */
 export class BrokenLinkCallback {
   free(): void;
-  constructor(resolve: BrokenLinkCallbackFunction);
+  [Symbol.dispose](): void;
   call(thisArg: any, reference: BrokenLinkReference): Option<ResolvedReference>;
+  constructor(resolve: BrokenLinkCallbackFunction);
   get resolve(): BrokenLinkCallbackFunction;
   set resolve(value: Function);
 }
+
 /**
  * The `HeadingAdapter` API allows you to customize how headings are rendered
  * by Comrak (`h1`, `h2`, ...) via custom `enter` and `exit` methods.
@@ -169,6 +71,7 @@ export class BrokenLinkCallback {
  */
 export class HeadingAdapter {
   free(): void;
+  [Symbol.dispose](): void;
   constructor(
     enter: (
       this: HeadingMeta,
@@ -178,6 +81,7 @@ export class HeadingAdapter {
     exit: (this: HeadingMeta, heading: HeadingMeta) => string,
   );
 }
+
 /**
  * The `SyntaxHighlighterAdapter` API allows you to customize how code blocks
  * are highlighted by Comrak, by specifying three custom rendering methods:
@@ -192,12 +96,14 @@ export class HeadingAdapter {
  */
 export class SyntaxHighlighterAdapter {
   free(): void;
+  [Symbol.dispose](): void;
   constructor(
     highlight: (code: string, lang?: string | null) => string,
     pre: (attrs: Record<string, string>) => string,
     code: (attrs: Record<string, string>) => string,
   );
 }
+
 /**
  * The `URLRewriter` API allows you to rewrite the URLs of links and images
  * being converted from Markdown to HTML by Comrak. You can leverage this API
@@ -210,8 +116,121 @@ export class SyntaxHighlighterAdapter {
  */
 export class URLRewriter {
   free(): void;
-  constructor(rewriter: URLRewriterFunction);
+  [Symbol.dispose](): void;
   call(thisArg: any, url: string): string;
+  constructor(rewriter: URLRewriterFunction);
   get rewriter(): URLRewriterFunction;
   set rewriter(value: Function);
 }
+
+export function default_extension_options(): object;
+
+export function default_options(): object;
+
+export function default_parse_options(): object;
+
+export function default_render_options(): object;
+
+/**
+ * r" Format an AST to CommonMark using plugins.
+ * r"
+ * r" See the documentation of the crate root for an example.
+ */
+export function format_commonmark(
+  ast: AST,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * r" Format an AST to HTML using plugins.
+ * r"
+ * r" See the documentation of the crate root for an example.
+ */
+export function format_html(
+  ast: AST,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * r" Format an AST to XML using plugins.
+ * r"
+ * r" See the documentation of the crate root for an example.
+ */
+export function format_xml(
+  ast: AST,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * r" Render Markdown to CommonMark.
+ * r" See the documentation of the crate root for an example.
+ */
+export function markdown_to_commonmark(
+  md: string,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * r" Render Markdown to HTML using plugins.
+ * r" See the documentation of the crate root for an example.
+ */
+export function markdown_to_html(
+  md: string,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * r" Render Markdown to XML using plugins.
+ * r"
+ * r" See the documentation of the crate root for an example.
+ */
+export function markdown_to_xml(
+  md: string,
+  options: Option<Options>,
+  codefence_syntax_highlighter: Option<SyntaxHighlighterAdapter>,
+  heading_adapter: Option<HeadingAdapter>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): string;
+
+/**
+ * Parses the given markdown text and returns the AST as a structured object.
+ */
+export function parse_document(
+  md: string,
+  options: Option<Options>,
+  broken_link_callback: Option<BrokenLinkCallbackFunction>,
+  image_url_rewriter: Option<URLRewriterFunction>,
+  link_url_rewriter: Option<URLRewriterFunction>,
+): AST;
+
+/**
+ * Returns the version of Comrak used in this build, as a string.
+ */
+export function version(): string;

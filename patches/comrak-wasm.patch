@@ -1,0 +1,1108 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -40,6 +40,8 @@
+ harness = false
+ 
+ [dependencies]
++serde = { version = "1", optional = true, features = ["derive", "rc"] }
++serde_json = { version = "1", optional = true }
+ typed-arena = "2.0.2"
+ shell-words = { version = "1.1", optional = true }
+ emojis = { version = "0.9", optional = true }
+@@ -50,7 +52,7 @@
+ memchr-n = "0.1.7"
+ phf = "0.14"
+ rustc-hash = "2"
+-smallvec = "1.13"
++smallvec = { version = "1.13", features = ["serde"] }
+ finl_unicode = { version = "1.4.0", features = ["categories"] }
+ 
+ [dev-dependencies]
+@@ -68,6 +70,8 @@
+ phf_codegen = "0.14"
+ 
+ [features]
++serialization = ["serde", "dep:serde_json"]
++serde = ["dep:serde"]
+ default = ["cli", "syntect-onig", "bon"]
+ cli = ["clap", "bon", "shell-words", "xdg", "fmt2io", "shortcodes", "phoenix_heex", "attributes"]
+ shortcodes = ["emojis"]
+--- a/src/adapters.rs
++++ b/src/adapters.rs
+@@ -60,6 +60,7 @@
+ 
+ /// The struct passed to the [`HeadingAdapter`] for custom heading implementations.
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct HeadingMeta {
+     /// The level of the heading; from 1 to 6 for ATX headings, 1 or 2 for setext headings.
+     pub level: u8,
+--- a/src/arena_tree.rs
++++ b/src/arena_tree.rs
+@@ -25,6 +25,284 @@
+ 
+     /// The data held by the node.
+     pub data: T,
++}
++
++#[cfg(feature = "serde")]
++mod serde_impls {
++    use super::Node;
++    use std::collections::HashMap;
++
++    use serde::{Deserialize, Serialize, Serializer, de::Error as DeError};
++    use typed_arena::Arena;
++
++    /// Serializable representation of a Node for serde.
++    ///
++    /// Avoids cycles during serialization/deserialization by using integer
++    /// indices instead of actual references. These are resolved during
++    /// deserialization into actual references after all nodes are created.
++    ///
++    /// All indices are relative to the [`WireTree::nodes`] array, which holds
++    /// all nodes in the tree and acts as a temporary arena for this purpose.
++    #[derive(Default, Serialize, Deserialize)]
++    struct WireNode<T> {
++        parent: Option<u32>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        previous_sibling: Option<u32>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        next_sibling: Option<u32>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        first_child: Option<u32>,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        last_child: Option<u32>,
++        data: T,
++    }
++
++    /// Serializable representation of an arena tree for serde.
++    ///
++    /// Holds all nodes in a flat vector to avoid cycles during
++    /// serialization and deserialization. References between nodes are represented
++    /// as integer indices in the array. These are resolved during the final
++    /// resolution step of deserialization, after all nodes are created, into
++    /// actual references and [`Node`] structs. This allows serde to serialize
++    /// and deserialize the [`Node`] tree structure without running into issues
++    /// with reference cycles.
++    #[derive(Default, Serialize, Deserialize)]
++    struct WireTree<T> {
++        nodes: Vec<WireNode<T>>,
++    }
++
++    impl<'a, T: 'a> Serialize for Node<'a, T>
++    where
++        T: Serialize,
++    {
++        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++        where
++            S: Serializer,
++        {
++            // Force the borrow of `self` to match the lifetime carried by the
++            // node so it can be threaded through the traversal.
++            let root: &'a Node<'a, T> =
++                unsafe { std::mem::transmute::<&Node<'a, T>, &'a Node<'a, T>>(self) };
++            let mut ordered = Vec::new();
++            for node in root.descendants() {
++                ordered.push(node);
++            }
++
++            let mut ids = HashMap::with_capacity(ordered.len());
++            for (idx, node) in ordered.iter().enumerate() {
++                ids.insert(std::ptr::from_ref(*node) as usize, idx as u32);
++            }
++
++            let index_for = |node: Option<&'a Node<'a, T>>| {
++                node.map(|n| ids[&(std::ptr::from_ref(n) as usize)])
++            };
++
++            WireTree {
++                nodes: ordered
++                    .iter()
++                    .map(|node| WireNode {
++                        parent: index_for(node.parent()),
++                        previous_sibling: index_for(node.previous_sibling()),
++                        next_sibling: index_for(node.next_sibling()),
++                        first_child: index_for(node.first_child()),
++                        last_child: index_for(node.last_child()),
++                        data: &node.data,
++                    })
++                    .collect::<Vec<_>>(),
++            }
++            .serialize(serializer)
++        }
++    }
++
++    impl<'a, 'de, T: 'a + 'de> serde::Deserialize<'de> for &'a Node<'a, T>
++    where
++        T: serde::Deserialize<'de>,
++    {
++        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++        where
++            D: serde::Deserializer<'de>,
++        {
++            let WireTree { nodes: wire_nodes } = WireTree::<T>::deserialize(deserializer)?;
++            if wire_nodes.is_empty() {
++                return Err(DeError::custom("cannot deserialize empty tree"));
++            }
++
++            let arena = Box::leak(Box::new(Arena::<Node<'de, T>>::new()));
++            let mut nodes: Vec<&Node<'de, T>> = Vec::with_capacity(wire_nodes.len());
++            let mut peers = Vec::with_capacity(wire_nodes.len());
++
++            for wire in wire_nodes.into_iter() {
++                peers.push((
++                    wire.parent,
++                    wire.previous_sibling,
++                    wire.next_sibling,
++                    wire.first_child,
++                    wire.last_child,
++                ));
++                nodes.push(arena.alloc(Node::new(wire.data)));
++            }
++
++            for (node, peer) in nodes.iter().zip(peers.into_iter()) {
++                let (parent, prev, next, first, last) = peer;
++                let parent_ref =
++                    match parent {
++                        Some(i) => Some(*nodes.get(i as usize).ok_or_else(|| {
++                            DeError::custom(format!("node index {i} out of bounds"))
++                        })?),
++                        None => None,
++                    };
++                let prev_ref =
++                    match prev {
++                        Some(i) => Some(*nodes.get(i as usize).ok_or_else(|| {
++                            DeError::custom(format!("node index {i} out of bounds"))
++                        })?),
++                        None => None,
++                    };
++                let next_ref =
++                    match next {
++                        Some(i) => Some(*nodes.get(i as usize).ok_or_else(|| {
++                            DeError::custom(format!("node index {i} out of bounds"))
++                        })?),
++                        None => None,
++                    };
++                let first_ref =
++                    match first {
++                        Some(i) => Some(*nodes.get(i as usize).ok_or_else(|| {
++                            DeError::custom(format!("node index {i} out of bounds"))
++                        })?),
++                        None => None,
++                    };
++                let last_ref =
++                    match last {
++                        Some(i) => Some(*nodes.get(i as usize).ok_or_else(|| {
++                            DeError::custom(format!("node index {i} out of bounds"))
++                        })?),
++                        None => None,
++                    };
++
++                node.parent.set(parent_ref);
++                node.previous_sibling.set(prev_ref);
++                node.next_sibling.set(next_ref);
++                node.first_child.set(first_ref);
++                node.last_child.set(last_ref);
++            }
++
++            let root = nodes[0];
++            // SAFETY: The arena is leaked, so the references live for the
++            // remainder of the program. Since `T: 'a + 'de`, the data inside
++            // the nodes also live for 'a. Thus, the whole tree rooted at
++            // `root` lives for 'a; shortening the lifetime should be safe.
++            Ok(unsafe { core::mem::transmute::<&Node<'de, T>, &Node<'a, T>>(root) })
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use crate::nodes::Ast;
++
++        use super::super::*;
++        use serde_json;
++        #[test]
++        fn basic_serialization_roundtrip() {
++            let arena = typed_arena::Arena::new();
++            let root = arena.alloc(Node::new("root"));
++            let child1 = arena.alloc(Node::new("child1"));
++            let child2 = arena.alloc(Node::new("child2"));
++            root.append(child1);
++            root.append(child2);
++
++            let serialized = serde_json::to_string(&root).unwrap();
++            let deserialized: &Node<'_, &str> = serde_json::from_str(&serialized).unwrap();
++
++            assert_eq!(deserialized.data, "root");
++
++            let mut children = deserialized.children();
++            assert_eq!(children.next().unwrap().data, "child1");
++            assert_eq!(children.next().unwrap().data, "child2");
++            assert!(children.next().is_none());
++        }
++
++        #[test]
++        fn empty_tree_serialization_fails() {
++            let result: Result<&Node<'_, &str>, _> = serde_json::from_str(r#"{"nodes":[]}"#);
++            assert!(result.is_err());
++        }
++
++        #[test]
++        fn out_of_bounds_index_fails() {
++            let result: Result<&Node<'_, &str>, _> = serde_json::from_str(
++                r#"{
++    "nodes": [
++        {
++            "first_child": 1,
++            "last_child": 1,
++            "data": "root"
++        }
++    ]
++}"#,
++            );
++            assert!(result.is_err());
++        }
++
++        #[test]
++        /// A more complex tree to ensure references are correctly resolved
++        /// when deserializing a tree with multiple levels and siblings, much
++        /// like our actual parsed AST structures.
++        fn complex_tree_serialization_roundtrip() {
++            use crate::Arena;
++            use crate::nodes::NodeValue;
++            use crate::options::*;
++            use crate::parse_document;
++            let arena = Arena::new();
++            let root = parse_document(
++                &arena,
++                r#"# Hello World
++
++## This is a subtitle
++
++And this a paragraph.
++"#,
++                &Options::default(),
++            );
++
++            let serialized = serde_json::to_string_pretty(&root).unwrap();
++            let deserialized: &Node<'_, RefCell<Ast>> = serde_json::from_str(&serialized).unwrap();
++
++            // Check root node
++            assert!(matches!(deserialized.data().value, NodeValue::Document));
++
++            // Check first child (heading 1)
++            let mut children = deserialized.children();
++
++            let heading1 = children.next().unwrap();
++            assert!(matches!(heading1.data().value, NodeValue::Heading(_)));
++
++            let heading1_text = heading1.first_child().unwrap();
++            assert!(
++                matches!(heading1_text.data().value, NodeValue::Text(ref text) if *text == "Hello World")
++            );
++
++            // Check second child (heading 2)
++            let heading2 = children.next().unwrap();
++            assert!(matches!(heading2.data().value, NodeValue::Heading(_)));
++
++            let heading2_text = heading2.first_child().unwrap();
++            assert!(
++                matches!(heading2_text.data().value, NodeValue::Text(ref text) if *text == "This is a subtitle")
++            );
++
++            // Check third child (paragraph)
++            let paragraph = children.next().unwrap();
++            assert!(matches!(paragraph.data().value, NodeValue::Paragraph));
++
++            let paragraph_text = paragraph.first_child().unwrap();
++            assert!(
++                matches!(paragraph_text.data().value, NodeValue::Text(ref text) if *text == "And this a paragraph.")
++            );
++
++            assert!(children.next().is_none());
++        }
++    }
+ }
+ 
+ /// A simple Debug implementation that prints the children as a tree, without
+--- a/src/cm.rs
++++ b/src/cm.rs
+@@ -579,7 +579,7 @@
+             NodeValue::Underline => self.format_underline()?,
+             NodeValue::Subscript => self.format_subscript()?,
+             NodeValue::SpoileredText => self.format_spoiler()?,
+-            NodeValue::EscapedTag(net) => self.format_escaped_tag(net)?,
++            NodeValue::EscapedTag(ref net) => self.format_escaped_tag(net)?,
+             NodeValue::Alert(ref alert) => self.format_alert(alert, entering)?,
+             NodeValue::Callout(ref nc) => self.format_callout(node, nc, entering)?,
+             NodeValue::CalloutTitle => self.format_callout_title(entering)?,
+--- a/src/html.rs
++++ b/src/html.rs
+@@ -403,7 +403,7 @@
+         NodeValue::DescriptionList => render_description_list(context, node, entering),
+         NodeValue::DescriptionTerm => render_description_term(context, node, entering),
+         NodeValue::Escaped => render_escaped(context, node, entering),
+-        NodeValue::EscapedTag(net) => render_escaped_tag(context, net),
++        NodeValue::EscapedTag(ref net) => render_escaped_tag(context, net),
+         NodeValue::FrontMatter(_) => Ok(ChildRendering::HTML),
+         NodeValue::Math(ref nm) => render_math(context, node, entering, nm),
+         NodeValue::MultilineBlockQuote(_) => render_multiline_block_quote(context, node, entering),
+@@ -690,6 +690,8 @@
+             context.escape(literal)?;
+         } else if !context.options.render.r#unsafe {
+             context.write_str("<!-- raw HTML omitted -->")?;
++        } else if context.options.extension.tagfilter {
++            tagfilter_block(context, literal)?;
+         } else {
+             context.write_str(literal)?;
+         }
+@@ -739,6 +741,9 @@
+             context.escape(literal)?;
+         } else if !context.options.render.r#unsafe {
+             context.write_str("<!-- raw HTML omitted -->")?;
++        } else if context.options.extension.tagfilter && tagfilter(literal) {
++            context.write_str("&lt;")?;
++            context.write_str(&literal[1..])?;
+         } else {
+             context.write_str(literal)?;
+         }
+@@ -1892,3 +1897,58 @@
+     output.write_str(">")?;
+     Ok(())
+ }
++
++fn tagfilter(literal: &str) -> bool {
++    let bytes = literal.as_bytes();
++
++    static TAGFILTER_BLACKLIST: [&str; 9] = [
++        "title",
++        "textarea",
++        "style",
++        "xmp",
++        "iframe",
++        "noembed",
++        "noframes",
++        "script",
++        "plaintext",
++    ];
++
++    if bytes.len() < 3 || bytes[0] != b'<' {
++        return false;
++    }
++
++    let mut i = 1;
++    if bytes[i] == b'/' {
++        i += 1;
++    }
++
++    let lc = literal[i..].to_lowercase();
++    for t in TAGFILTER_BLACKLIST.iter() {
++        if lc.starts_with(t) {
++            let j = i + t.len();
++            let Some(&b) = bytes.get(j) else {
++                return false;
++            };
++            return isspace(b) || b == b'>' || (b == b'/' && bytes.get(j + 1) == Some(&b'>'));
++        }
++    }
++
++    false
++}
++
++fn tagfilter_block(output: &mut dyn Write, buffer: &str) -> fmt::Result {
++    let bytes = buffer.as_bytes();
++
++    let mut offset = 0;
++    while let Some(i) = bytes[offset..].iter().position(|&byte| byte == b'<') {
++        output.write_str(&buffer[offset..offset + i])?;
++        if tagfilter(&buffer[offset + i..]) {
++            output.write_str("&lt;")?;
++        } else {
++            output.write_str("<")?;
++        }
++        offset += i + 1;
++    }
++    output.write_str(&buffer[offset..])?;
++    Ok(())
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -158,3 +158,6 @@
+     format_xml_with_plugins(root, options, &mut out, plugins).unwrap();
+     out
+ }
++
++#[cfg(feature = "serde")]
++mod wasm_serde;
+--- a/src/nodes.rs
++++ b/src/nodes.rs
+@@ -31,6 +31,7 @@
+     test,
+     strum_discriminants(vis(pub(crate)), derive(strum::VariantArray, Hash))
+ )]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum NodeValue {
+     /// The root of every CommonMark document.  Contains **blocks**.
+     Document,
+@@ -135,7 +136,9 @@
+     /// **Block**. [Task list item](https://github.github.com/gfm/#task-list-items-extension-).
+     /// The value is the symbol that was used in the brackets to mark a task item as checked, or
+     /// `None` if the item is unchecked.
+-    TaskItem(NodeTaskItem),
++    TaskItem(
++        #[cfg_attr(feature = "serde", serde(with = "crate::wasm_serde::task_item"))] NodeTaskItem,
++    ),
+ 
+     /// **Inline**.  A [soft line break](https://github.github.com/gfm/#soft-line-breaks).  If
+     /// the `hardbreaks` option is set in `Options` during formatting, it will be formatted
+@@ -243,7 +246,7 @@
+ 
+     /// **Inline**. Text surrounded by escaped markup. Enabled with `spoiler` option.
+     /// The `&'static str` is the tag to be escaped.
+-    EscapedTag(&'static str),
++    EscapedTag(String),
+ 
+     /// **Block**. GitHub style alert boxes which uses a modified blockquote syntax.
+     /// Enabled with the `alerts` option.
+@@ -285,6 +288,7 @@
+ 
+ /// Alignment of a single table cell.
+ #[derive(Debug, Copy, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum TableAlignment {
+     /// Cell content is unaligned.
+     None,
+@@ -312,6 +316,7 @@
+ 
+ /// The metadata of a table
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeTable {
+     /// The table alignments
+     pub alignments: Vec<TableAlignment>,
+@@ -328,6 +333,7 @@
+ 
+ /// A task list item's contents, and where it was found
+ #[derive(Debug, Clone, PartialEq, Eq, Copy)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeTaskItem {
+     /// The symbol within the brackets used to mark the task item as checked,
+     /// or `None` if unchecked.
+@@ -339,6 +345,14 @@
+ 
+ /// An inline [code span](https://github.github.com/gfm/#code-spans).
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(
++    feature = "serde",
++    serde(
++        from = "crate::wasm_serde::CodeWire",
++        into = "crate::wasm_serde::CodeWire"
++    )
++)]
+ pub struct NodeCode {
+     /// The number of backticks
+     pub num_backticks: usize,
+@@ -352,6 +366,7 @@
+ 
+ /// The details of a link's destination, or an image's source.
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeLink {
+     /// The URL for the link destination or image source.
+     pub url: String,
+@@ -366,15 +381,18 @@
+ /// The details of a wikilink's destination.
+ /// For both `[[link]]` and `![[embed]]` syntax
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeWikiLink {
+     /// The URL for the link destination.
+     pub url: String,
+     /// If true, this is an embed link, otherwise a normal link.
++    #[cfg_attr(feature = "serde", serde(default))]
+     pub embed: bool,
+ }
+ 
+ /// The metadata of a list; the kind of list, the delimiter used and so on.
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeList {
+     /// The kind of list (bullet (unordered) or ordered).
+     pub list_type: ListType,
+@@ -404,6 +422,7 @@
+ 
+ /// The metadata of a description list
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeDescriptionItem {
+     /// Number of spaces before the list marker.
+     pub marker_offset: usize,
+@@ -418,6 +437,7 @@
+ 
+ /// The type of list.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum ListType {
+     /// A bullet list, i.e. an unordered list.
+     #[default]
+@@ -429,6 +449,7 @@
+ 
+ /// The delimiter for ordered lists, i.e. the character which appears after each number.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum ListDelimType {
+     /// A period character `.`.
+     #[default]
+@@ -449,6 +470,7 @@
+ 
+ /// The metadata and data of a code block (fenced or indented).
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeCodeBlock {
+     /// Whether the code block is fenced.
+     pub fenced: bool,
+@@ -478,6 +500,7 @@
+ 
+ /// The metadata of a heading.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeHeading {
+     /// The level of the header; from 1 to 6 for ATX headings, 1 or 2 for setext headings.
+     pub level: u8,
+@@ -492,6 +515,7 @@
+ 
+ /// The metadata of an included HTML block.
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeHtmlBlock {
+     /// The HTML block's type
+     pub block_type: u8,
+@@ -503,6 +527,7 @@
+ 
+ /// The metadata of a footnote definition.
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeFootnoteDefinition {
+     /// The name of the footnote.
+     pub name: String,
+@@ -513,6 +538,7 @@
+ 
+ /// The metadata of a footnote reference.
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeFootnoteReference {
+     /// The name of the footnote.
+     pub name: String,
+@@ -529,6 +555,7 @@
+ 
+ /// The metadata of a multiline blockquote.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeMultilineBlockQuote {
+     /// The length of the fence.
+     pub fence_length: usize,
+@@ -539,6 +566,7 @@
+ 
+ /// An inline math span
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeMath {
+     /// Whether this is dollar math (`$` or `$$`).
+     /// `false` indicates it is code math
+@@ -556,6 +584,7 @@
+ 
+ /// An inline comment span
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeComment {
+     /// The literal contents of the comment span.
+     /// As the contents are not interpreted as Markdown at all,
+@@ -567,6 +596,7 @@
+ 
+ /// A block comment span
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeCommentBlock {
+     /// The literal contents of the comment block.
+     /// As the contents are not interpreted as Markdown at all,
+@@ -580,6 +610,7 @@
+ 
+ /// The metadata of an Alert node.
+ #[derive(Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeAlert {
+     /// Type of alert
+     pub alert_type: AlertType,
+@@ -599,6 +630,7 @@
+ 
+ /// The initial fold state of a callout.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum CalloutFold {
+     /// The callout is not foldable.
+     None,
+@@ -612,6 +644,7 @@
+ 
+ /// The metadata of a callout node.
+ #[derive(Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeCallout {
+     /// The normalized callout type.
+     pub callout_type: String,
+@@ -654,6 +687,7 @@
+ 
+ /// The type of alert.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum AlertType {
+     /// Useful information that users should know, even when skimming content
+     #[default]
+@@ -703,6 +737,7 @@
+ 
+ /// The metadata of a container block directive node.
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeBlockDirective {
+     /// The length of the fence.
+     pub fence_length: usize,
+@@ -744,6 +779,7 @@
+ /// the block offset, or you'll get an unwanted code block!
+ #[cfg(feature = "attributes")]
+ #[derive(Default, Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Attributes {
+     /// The id attribute, if any; specified like `#id` (last wins).
+     pub id: Option<String>,
+@@ -906,6 +942,14 @@
+ /// The struct contains metadata about the node's position in the original document, and the core
+ /// enum, `NodeValue`.
+ #[derive(Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(
++    feature = "serde",
++    serde(
++        from = "crate::wasm_serde::AstWire",
++        into = "crate::wasm_serde::AstWire"
++    )
++)]
+ pub struct Ast {
+     /// The node value itself.
+     pub value: NodeValue,
+@@ -920,10 +964,12 @@
+     pub(crate) open: bool,
+     pub(crate) last_line_blank: bool,
+     pub(crate) table_visited: bool,
++    #[cfg_attr(feature = "serde", serde(default))]
+     pub(crate) lines: Option<Box<BlockLines>>,
+ }
+ 
+ #[derive(Clone, Default, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub(crate) struct BlockLines {
+     pub(crate) content: String,
+     pub(crate) offsets: smallvec::SmallVec<[usize; 4]>,
+@@ -957,6 +1003,7 @@
+ 
+ /// Represents the position in the source Markdown this node was rendered from.
+ #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Sourcepos {
+     /// The line and column of the first character of this node.
+     pub start: LineColumn,
+@@ -1011,6 +1058,7 @@
+ /// Enable [`parse.sourcepos_chars`][crate::options::Parse#structfield.sourcepos_chars] to have
+ /// column values reported as a Unicode character count instead.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct LineColumn {
+     /// The 1-based line number of the character.
+     pub line: usize,
+--- a/src/parser/inlines.rs
++++ b/src/parser/inlines.rs
+@@ -1718,9 +1718,9 @@
+                 if self.options.extension.strikethrough {
+                     NodeValue::Strikethrough
+                 } else if use_delims == 1 {
+-                    NodeValue::EscapedTag("~")
++                    NodeValue::EscapedTag("~".to_owned())
+                 } else {
+-                    NodeValue::EscapedTag("~~")
++                    NodeValue::EscapedTag("~~".to_owned())
+                 }
+             } else if self.options.extension.superscript && opener_byte == b'^' {
+                 NodeValue::Superscript
+@@ -1728,19 +1728,19 @@
+                 if self.options.extension.highlight {
+                     NodeValue::Highlight
+                 } else {
+-                    NodeValue::EscapedTag("==")
++                    NodeValue::EscapedTag("==".to_owned())
+                 }
+             } else if opener_byte == b'+' {
+                 if self.options.extension.insert {
+                     NodeValue::Insert
+                 } else {
+-                    NodeValue::EscapedTag("++")
++                    NodeValue::EscapedTag("++".to_owned())
+                 }
+             } else if self.options.extension.spoiler && opener_byte == b'|' {
+                 if use_delims == 2 {
+                     NodeValue::SpoileredText
+                 } else {
+-                    NodeValue::EscapedTag("|")
++                    NodeValue::EscapedTag("|".to_owned())
+                 }
+             } else if self.options.extension.underline && opener_byte == b'_' && use_delims == 2 {
+                 NodeValue::Underline
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -247,6 +247,7 @@
+ 
+ /// A reference link's resolved details.
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct ResolvedReference {
+     /// The destination URL of the reference link.
+     pub url: String,
+--- a/src/parser/options.rs
++++ b/src/parser/options.rs
+@@ -14,6 +14,9 @@
+ #[derive(Default, Debug, Clone)]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Umbrella options struct.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct Options<'c> {
+     /// Enable CommonMark extensions.
+     pub extension: Extension<'c>,
+@@ -29,7 +32,13 @@
+ #[cfg_attr(feature = "bon", derive(Builder))]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Options to select extensions.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct Extension<'c> {
++    /// Legacy GFM tag filter; retained for comrak-wasm compatibility.
++    #[cfg_attr(feature = "bon", builder(default))]
++    pub tagfilter: bool,
+     /// Enables the
+     /// [strikethrough extension](https://github.github.com/gfm/#strikethrough-extension-)
+     /// from the GFM spec.
+@@ -545,6 +554,7 @@
+     ///            "<p><img src=\"https://safe.example.com?url=http://unsafe.example.com/bad.png\" alt=\"\" /></p>\n");
+     /// ```
+     #[cfg_attr(feature = "arbitrary", arbitrary(value = None))]
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub image_url_rewriter: Option<Arc<dyn URLRewriter + 'c>>,
+ 
+     /// Wraps link URLs using a function or custom trait object.
+@@ -562,6 +572,7 @@
+     ///            "<p><a href=\"https://safe.example.com/norefer?url=http://unsafe.example.com/bad\">my link</a></p>\n");
+     /// ```
+     #[cfg_attr(feature = "arbitrary", arbitrary(value = None))]
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub link_url_rewriter: Option<Arc<dyn URLRewriter + 'c>>,
+ 
+     /// Recognizes many emphasis that appear in CJK contexts but are not recognized by plain CommonMark.
+@@ -769,6 +780,8 @@
+ #[derive(Debug, Clone, PartialEq, Eq, Copy)]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Selects between wikilinks with the title first or the URL first.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+ pub enum WikiLinksMode {
+     /// Indicates that the URL precedes the title. For example: `[[http://example.com|link
+     /// title]]`.
+@@ -804,6 +817,9 @@
+ #[cfg_attr(feature = "bon", derive(Builder))]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Options for parser functions.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct Parse<'c> {
+     /// Punctuation (quotes, full-stops and hyphens) are converted into 'smart' punctuation.
+     ///
+@@ -923,6 +939,7 @@
+     ///            A [broken link] renders as text.</p>\n");
+     /// ```
+     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub broken_link_callback: Option<Arc<dyn BrokenLinkCallback + 'c>>,
+ 
+     /// Leave footnote definitions in place in the document tree, rather than
+@@ -1064,6 +1081,8 @@
+ /// Struct to the broken link callback, containing details on the link reference
+ /// which failed to find a match.
+ #[derive(Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+ pub struct BrokenLinkReference<'l> {
+     /// The normalized reference link label. Unicode case folding is applied;
+     /// see <https://github.com/commonmark/commonmark-spec/issues/695> for a
+@@ -1078,6 +1097,9 @@
+ #[cfg_attr(feature = "bon", derive(Builder))]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Options for formatter functions.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct Render {
+     /// [Soft line breaks](http://spec.commonmark.org/0.27/#soft-line-breaks) in the input
+     /// translate into hard line breaks in the output.
+@@ -1108,6 +1130,7 @@
+     ///            "<pre lang=\"rust\"><code>fn hello();\n</code></pre>\n");
+     /// ```
+     #[cfg_attr(feature = "bon", builder(default))]
++    #[cfg_attr(feature = "serde", serde(rename = "githubPreLang"))]
+     pub github_pre_lang: bool,
+ 
+     /// Enable full info strings for code blocks
+@@ -1421,6 +1444,8 @@
+ #[derive(Debug, Clone, Copy, Default)]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Options for bulleted list rendering in markdown. See [`Render::list_style`] for more details.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+ pub enum ListStyleType {
+     /// The `-` character
+     #[default]
+@@ -1434,6 +1459,8 @@
+ #[derive(Debug, Clone, Copy, Default)]
+ #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+ /// Options for alert rendering in markdown. See [`Render::alert_style`] for more details.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+ pub enum AlertStyleType {
+     /// `div`s with `class="markdown-alert markdown-alert-<type>"`
+     #[default]
+@@ -1445,6 +1472,9 @@
+ #[derive(Default, Debug, Clone)]
+ #[cfg_attr(feature = "bon", derive(Builder))]
+ /// Umbrella plugins struct.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct Plugins<'p> {
+     /// Configure render-time plugins.
+     #[cfg_attr(feature = "bon", builder(default))]
+@@ -1454,12 +1484,16 @@
+ #[derive(Default, Clone)]
+ #[cfg_attr(feature = "bon", derive(Builder))]
+ /// Plugins for alternative rendering.
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
++#[cfg_attr(feature = "serde", serde(default))]
+ pub struct RenderPlugins<'p> {
+     /// Provide language-specific renderers for codefence blocks.
+     ///
+     /// `math` codefence blocks are handled separately by Comrak's built-in math renderer,
+     /// so entries keyed by `"math"` in this map are not used.
+     #[cfg_attr(feature = "bon", builder(default))]
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub codefence_renderers: HashMap<String, &'p dyn CodefenceRendererAdapter>,
+ 
+     /// Provide a syntax highlighter adapter implementation for syntax
+@@ -1499,9 +1533,11 @@
+     /// assert_eq!(markdown_to_html_with_plugins(input, &options, &plugins),
+     ///            "<pre lang=\"rust\"><code class=\"language-rust\"><span class=\"lang-rust\">fn main<'a>();\n</span></code></pre>\n");
+     /// ```
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub codefence_syntax_highlighter: Option<&'p dyn SyntaxHighlighterAdapter>,
+ 
+     /// Optional heading adapter
++    #[cfg_attr(feature = "serde", serde(skip))]
+     pub heading_adapter: Option<&'p dyn HeadingAdapter>,
+ }
+ 
+--- a/src/parser/phoenix_heex.rs
++++ b/src/parser/phoenix_heex.rs
+@@ -1,5 +1,6 @@
+ /// Represents the type of Phoenix HEEx node.
+ #[derive(Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum HeexNode {
+     /// A directive like `<% %>` or `<%= %>`.
+     Directive,
+@@ -15,6 +16,7 @@
+ 
+ /// The metadata of a Phoenix HEEx block-level element.
+ #[derive(Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeHeexBlock {
+     /// The literal contents of the Phoenix block element, including delimiters.
+     pub literal: String,
+--- a/src/parser/shortcodes.rs
++++ b/src/parser/shortcodes.rs
+@@ -2,6 +2,7 @@
+ ///
+ /// ("gemoji" name context: <https://github.com/github/gemoji>)
+ #[derive(Debug, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NodeShortCode {
+     /// The shortcode that was resolved, e.g. "rabbit".
+     pub code: String,
+--- /dev/null
++++ b/src/wasm_serde.rs
+@@ -0,0 +1,148 @@
++//! Compatibility for comrak-wasm's existing serialized AST contract.
++use crate::nodes::{Ast, BlockLines, NodeCode, NodeTaskItem, NodeValue, Sourcepos};
++use serde::{Deserialize, Serialize};
++
++#[derive(Serialize, Deserialize)]
++pub(crate) struct AstWire {
++    value: NodeValue,
++    sourcepos: Sourcepos,
++    #[serde(default)]
++    content: String,
++    #[serde(default)]
++    line_offsets: Vec<usize>,
++    #[serde(default)]
++    open: bool,
++    #[serde(default)]
++    last_line_blank: bool,
++    #[serde(default)]
++    table_visited: bool,
++    #[cfg(feature = "attributes")]
++    #[serde(default)]
++    attrs: Option<Box<crate::nodes::Attributes>>,
++    #[serde(default)]
++    lines: Option<Box<BlockLines>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    task_item_sourcepos: Option<Sourcepos>,
++}
++
++impl From<Ast> for AstWire {
++    fn from(ast: Ast) -> Self {
++        let task_item_sourcepos = match &ast.value {
++            NodeValue::TaskItem(item) => Some(item.symbol_sourcepos),
++            _ => None,
++        };
++        Self {
++            content: ast
++                .lines
++                .as_ref()
++                .map(|lines| lines.content.clone())
++                .unwrap_or_default(),
++            line_offsets: ast
++                .lines
++                .as_ref()
++                .map(|lines| lines.offsets.to_vec())
++                .unwrap_or_default(),
++            value: ast.value,
++            sourcepos: ast.sourcepos,
++            open: ast.open,
++            last_line_blank: ast.last_line_blank,
++            table_visited: ast.table_visited,
++            #[cfg(feature = "attributes")]
++            attrs: ast.attrs,
++            lines: ast.lines,
++            task_item_sourcepos,
++        }
++    }
++}
++
++impl From<AstWire> for Ast {
++    fn from(mut wire: AstWire) -> Self {
++        if let NodeValue::TaskItem(item) = &mut wire.value {
++            if let Some(sourcepos) = wire.task_item_sourcepos {
++                item.symbol_sourcepos = sourcepos;
++            }
++        }
++        let lines = wire.lines.or_else(|| {
++            if wire.content.is_empty() && wire.line_offsets.is_empty() {
++                None
++            } else {
++                Some(Box::new(BlockLines {
++                    content: wire.content,
++                    offsets: wire.line_offsets.into(),
++                }))
++            }
++        });
++        Self {
++            value: wire.value,
++            sourcepos: wire.sourcepos,
++            open: wire.open,
++            last_line_blank: wire.last_line_blank,
++            table_visited: wire.table_visited,
++            #[cfg(feature = "attributes")]
++            attrs: wire.attrs,
++            lines,
++        }
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++pub(crate) struct CodeWire {
++    literal: String,
++    // Kept for callers of the original TypeScript Code interface.
++    #[serde(default)]
++    info: String,
++    #[serde(default = "one_backtick")]
++    num_backticks: usize,
++}
++
++fn one_backtick() -> usize {
++    1
++}
++
++impl From<NodeCode> for CodeWire {
++    fn from(code: NodeCode) -> Self {
++        Self {
++            literal: code.literal,
++            num_backticks: code.num_backticks,
++            info: String::new(),
++        }
++    }
++}
++
++impl From<CodeWire> for NodeCode {
++    fn from(wire: CodeWire) -> Self {
++        Self {
++            literal: wire.literal,
++            num_backticks: wire.num_backticks,
++        }
++    }
++}
++
++pub(crate) mod task_item {
++    use super::*;
++
++    pub(crate) fn serialize<S: serde::Serializer>(
++        item: &NodeTaskItem,
++        serializer: S,
++    ) -> Result<S::Ok, S::Error> {
++        item.symbol.serialize(serializer)
++    }
++
++    pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(
++        deserializer: D,
++    ) -> Result<NodeTaskItem, D::Error> {
++        #[derive(Deserialize)]
++        #[serde(untagged)]
++        enum Wire {
++            Legacy(Option<char>),
++            Current(NodeTaskItem),
++        }
++        Ok(match Wire::deserialize(deserializer)? {
++            Wire::Legacy(symbol) => NodeTaskItem {
++                symbol,
++                symbol_sourcepos: (0, 0, 0, 0).into(),
++            },
++            Wire::Current(item) => item,
++        })
++    }
++}
+--- a/src/xml.rs
++++ b/src/xml.rs
+@@ -315,7 +315,7 @@
+                 NodeValue::Underline => {}
+                 NodeValue::Subscript => {}
+                 NodeValue::SpoileredText => {}
+-                NodeValue::EscapedTag(data) => {
++                NodeValue::EscapedTag(ref data) => {
+                     self.output.write_str(data)?;
+                 }
+                 NodeValue::MultilineComment(ref nmc) => {

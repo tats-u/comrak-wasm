@@ -7,9 +7,11 @@
 // deno-lint-ignore-file no-import-prefix
 
 import zlib from "node:zlib";
+import { pathToFileURL } from "node:url";
 
 import * as lz4 from "jsr:@nick/lz4@0.3.4";
 import { $, type Path } from "jsr:@david/dax@0.44.1";
+import { buildInputsHash } from "./build_inputs.ts";
 import { legacy } from "./parse_comrak_version.ts";
 
 type Algorithm = "brotli" | "lz4";
@@ -29,7 +31,7 @@ const MAX_WASM_SIZE = 750 * 1024; // 750KB
  */
 const WASM_COMPRESS = +(Deno.env.get("WASM_COMPRESS") || "11");
 
-const WASMBUILD_VERSION = Deno.env.get("WASMBUILD_VERSION") || "0.19.1";
+const WASMBUILD_VERSION = Deno.env.get("WASMBUILD_VERSION") || "0.23.0";
 
 async function requires(...executables: string[]) {
   for (const executable of executables) {
@@ -184,7 +186,7 @@ async function bundle(src: string | Path, dest: string | Path) {
   const src_dts = src.withExtname(".d.ts");
   const dest_dts = dest.withExtname(".d.ts");
 
-  await $`deno bundle -q --minify --platform browser --inline-imports=true --output=${dest} ${src}`;
+  await $`${Deno.execPath()} bundle -q --minify --platform browser --inline-imports=true --output=${dest} ${src}`;
 
   await $`cp ${src_dts} ${dest_dts}`;
 
@@ -236,23 +238,8 @@ async function build(...args: string[]) {
 
   log(`building using @deno/wasmbuild@${WASMBUILD_VERSION}`);
 
-  await $`deno run -Aq --env-file=.env jsr:@deno/wasmbuild@${WASMBUILD_VERSION} --inline --out ${OUT_DIR}`
-    .env({
-      WASM_OPT_LEVEL: Deno.env.get("WASM_OPT_LEVEL") ?? "z",
-      WASM_OPT_BULK_MEMORY: Deno.env.get("WASM_OPT_BULK_MEMORY") ?? "1",
-      WASM_OPT_EXTRA_ARGS: Deno.env.get("WASM_OPT_EXTRA_ARGS") ?? "",
-    });
-  // await run(
-  //   `building ${name}...`,
-  //   "deno",
-  //   "run",
-  //   "-Aq",
-  //   "--env-file=.env",
-  //   `jsr:@deno/wasmbuild@${WASMBUILD_VERSION}`,
-  //   "--inline",
-  //   "--out",
-  //   OUT_DIR,
-  // );
+  // wasmbuild's bundled optimizer predates the features emitted by modern Rust.
+  await $`${Deno.execPath()} run -Aq jsr:@deno/wasmbuild@${WASMBUILD_VERSION} --inline --skip-opt --out ${OUT_DIR}`;
 
   const generated = await Array.fromAsync(
     Deno.readDir(OUT_DIR),
@@ -260,8 +247,7 @@ async function build(...args: string[]) {
   );
 
   const [maybePath] = args;
-  const path = maybePath ||
-    generated.find((p) => /(?<!\.internal)\.m?js$/.test(p));
+  const path = maybePath || `${OUT_DIR}/${name}.js`;
   const stat = path ? await Deno.stat(path).catch(() => null) : null;
 
   if (!path || !stat) {
@@ -272,6 +258,67 @@ async function build(...args: string[]) {
   }
 
   await rewrite_exports(path);
+  const source = await Deno.readTextFile(path);
+  const pattern = /const bytes = base64decode\("(.+?)"\);/s;
+  const match = source.match(pattern);
+  if (!match) throw new Error("Could not locate inline Wasm to optimize");
+  const bytes = Uint8Array.fromBase64(match[1].replace(/\\|\s+/g, ""));
+  const exports = WebAssembly.Module.exports(new WebAssembly.Module(bytes));
+  const hasStart = exports.some((entry) => entry.name === "__wbindgen_start");
+  const level = Deno.env.get("WASM_OPT_LEVEL") || "z";
+  if (!/^[0-4sz]$/.test(level)) throw new Error("Invalid WASM_OPT_LEVEL");
+  const flags = [
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-reference-types",
+    "--enable-multivalue",
+  ];
+  if (Deno.env.get("WASM_OPT_BULK_MEMORY") !== "0") {
+    flags.push("--enable-bulk-memory", "--enable-bulk-memory-opt");
+  }
+  // Match the whitespace-separated arguments accepted by the old shell wrapper.
+  const extra = Deno.env.get("WASM_OPT_EXTRA_ARGS")?.trim();
+  if (extra) flags.push(...extra.split(/\s+/));
+  const temp = await Deno.makeTempDir({ prefix: "comrak-opt-" });
+  let output: Uint8Array<ArrayBuffer>;
+  try {
+    await Deno.writeFile(`${temp}/input.wasm`, bytes);
+    const result = await new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "-Aq",
+        "npm:binaryen@132.0.0/bin/wasm-opt",
+        `-O${level}`,
+        ...flags,
+        `${temp}/input.wasm`,
+        "-o",
+        `${temp}/output.wasm`,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (!result.success) {
+      throw new Error(new TextDecoder().decode(result.stderr).slice(-8000));
+    }
+    output = await Deno.readFile(`${temp}/output.wasm`);
+    if (!WebAssembly.validate(output)) {
+      throw new Error("Optimized Wasm failed validation");
+    }
+  } finally {
+    await Deno.remove(temp, { recursive: true });
+  }
+  const optimized = source.replace(
+    pattern,
+    () => `const bytes = base64decode("${output.toBase64()}");`,
+  );
+  // wasmbuild can report hasStart even when bindgen emitted no start export.
+  await Deno.writeTextFile(
+    path,
+    hasStart
+      ? optimized
+      : optimized.replace("wasm.exports.__wbindgen_start();", ""),
+  );
 
   let shouldCompress = legacy || stat.size > MAX_WASM_SIZE;
   if (WASM_COMPRESS === 0) shouldCompress = false;
@@ -294,6 +341,18 @@ async function build(...args: string[]) {
   const dest = out.join(src.basename());
 
   await bundle(src, dest);
+  const wasm = await import(pathToFileURL(dest.toString()).href);
+  if (
+    !wasm.markdown_to_html("**build check**").includes(
+      "<strong>build check</strong>",
+    )
+  ) {
+    throw new Error("Generated Wasm failed its rendering smoke test");
+  }
+  await Deno.writeTextFile(
+    "src/lib/build-inputs.txt",
+    await buildInputsHash() + "\n",
+  );
 }
 
 if (import.meta.main) await build(...Deno.args);

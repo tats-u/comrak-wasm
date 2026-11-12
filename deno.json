@@ -1,6 +1,6 @@
 {
   "name": "@nick/comrak",
-  "version": "0.48.0-rc.0",
+  "version": "0.59.0-rc.0",
   "license": "MIT",
   "author": {
     "name": "Nicholas Berlette",
@@ -26,7 +26,7 @@
       "command": "deno run -Aq --env-file=.env scripts/build.ts",
       "description": "Build, optimize, and compress the WASM binary."
     },
-    "build:exists": "deno eval \"var{exit:x,stat:s}=Deno,m=await s('./src/lib/comrak_wasm.js').then(r=>r.mtime,_=>0),l=await s('./crates/comrak-wasm/src/lib.rs').then(r=>r.mtime,_=>0);x(m&&l&&m>l?0:1)\"",
+    "build:exists": "deno run --allow-read scripts/build_inputs.ts",
     "build:ensure": {
       "description": "Ensures the WASM binary is built and up-to-date.",
       "command": "deno task build:exists || deno task build"

@@ -23,7 +23,7 @@ alloc = ["dep:lol_alloc", "serde/alloc"]
 bon = ["comrak/bon"]
 threading = ["alloc"]
 shortcodes = ["comrak/shortcodes"]
-syntect = []
+syntect = ["comrak/syntect-fancy"]
 std = [
   "wasm-bindgen/std",
   "wasm-bindgen/enable-interning",

@@ -1,5 +1,45 @@
 # [`@nick/comrak`]
 
+This package now uses **Comrak 0.59.0**. New options include:
+
+- `extension.mathLatex`, `insert`, `blockDirective`, `ofmCallouts`,
+  `ofmComments`, `phoenixHeex`, and `wikilinksIgnoreEmbeds`.
+- `extension.headerAttributes`, `fencedCodeAttributes`, `inlineCodeAttributes`,
+  and `linkAttributes` expose parsed attributes in `parseMarkdown()` node
+  `data.attrs`. Upstream formatters do not automatically emit these attributes.
+- `extension.headerIdPrefix` and `headerIdPrefixInHref` control heading anchors;
+  `headerIDs` remains an alias. Anchors use upstream's new accessible HTML.
+- `parse.sourceposChars`, `parse.shouldCancel`, `render.alertStyle`, and
+  `render.compactHtml`.
+- `plugins.render.codefenceRenderers` maps language names to functions receiving
+  `(lang, meta, code, sourcepos)` and returning the complete block HTML.
+
+```ts
+import { markdownToHTML } from "@nick/comrak";
+
+const html = markdownToHTML("++added++ and \\(x + y\\)", {
+  extension: { insert: true, mathLatex: true },
+});
+```
+
+Existing ASTs remain renderable: `TaskItem` keeps its string/null value and
+checkbox positions are exposed separately as `data.task_item_sourcepos`.
+`data.content`, `data.line_offsets`, and the original `Code.info` type remain
+available. New metadata fields are optional. Comrak 0.56 releases parser block
+buffers after inline parsing, so freshly parsed `line_offsets` can be empty;
+retained block data is exposed as optional `data.lines`. The indexed tree layout
+is unchanged. The legacy `tagfilter` and `headerIDs` options remain available.
+
+Comrak 0.54 changed heading/anchor HTML to improve accessibility; this package
+adopts that output. Source positions and parser/rendering bug fixes also follow
+upstream 0.59. Rust now requires at least 1.89, as required by Comrak 0.56.
+
+Comrak 0.59 has **not** added serde/AST serialization. The vendored source still
+carries local modifications; replacing the external fork is a maintenance
+change, not the removal of the need for modified Comrak code. Source provenance,
+the local patch, and future update instructions are in
+[`crates/comrak/VENDORED.md`](crates/comrak/VENDORED.md).
+
 <big>High-performance Markdown to HTML converter powered by WebAssembly.</big>
 
 ---
@@ -340,7 +380,7 @@ The `Options` interface mirrors the Rust crate's configuration surface, spanning
 
   assert.strictEqual(
     html,
-    '<h1><a href="#readme" aria-hidden="true" class="anchor" id="user-content-readme"></a>README</h1>\n',
+    `<h1 id="user-content-readme">README<a href="#readme" aria-label="Link to heading 'README'" data-heading-content="README" class="anchor"></a></h1>\n`,
   );
   ```
 

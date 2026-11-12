@@ -198,3 +198,15 @@ export interface SyntaxHighlighterAdapter {
    */
   code?(attrs: Record<string, string>): string;
 }
+
+/**
+ * Render an entire fenced block for a registered language (for example Mermaid).
+ * The returned HTML replaces the pre/code wrapper and syntax highlighter.
+ * @category Adapters
+ */
+export type CodefenceRenderer = (
+  lang: string,
+  meta: string,
+  code: string,
+  sourcepos: Sourcepos | null,
+) => string;

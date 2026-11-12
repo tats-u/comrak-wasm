@@ -15,10 +15,6 @@ use comrak::options::BrokenLinkCallback as ComrakBrokenLinkCallback;
 use comrak::options::BrokenLinkReference;
 use comrak::options::Plugins;
 use comrak::options::URLRewriter as ComrakURLRewriter;
-#[cfg(feature = "syntect")]
-use comrak::plugins::syntect::SyntectAdapter;
-#[cfg(feature = "syntect")]
-use comrak::plugins::syntect::SyntectAdapterBuilder;
 use js_sys::Function;
 use js_sys::Object;
 use js_sys::TypeError;
@@ -36,7 +32,6 @@ use lol_alloc::FreeListAllocator as Lol;
   feature = "threading"
 ))]
 use lol_alloc::LockedAllocator as Allocator;
-use serde::Deserialize;
 use serde_wasm_bindgen::from_value;
 use serde_wasm_bindgen::to_value;
 use wasm_bindgen::JsValue;
@@ -86,8 +81,8 @@ export type Option<T> = T | null | undefined;
 mod syntax_adapter {
   use ::core::ops::Deref;
   use ::core::ops::DerefMut;
+  use comrak::adapters::SyntaxHighlighterAdapter as ComrakSyntaxHighlighterAdapter;
   use comrak::plugins::syntect::SyntectAdapter;
-  use comrak::plugins::syntect::SyntectAdapterBuilder;
 
   use super::*;
 
@@ -119,7 +114,7 @@ mod syntax_adapter {
     /// Creates a new `SyntaxHighlighterAdapter` using the specified theme.
     #[wasm_bindgen(constructor)]
     pub fn new(theme: &str) -> Self {
-      let adapter = SyntectAdapter::new_js(theme);
+      let adapter = SyntectAdapter::new(Some(theme));
       SyntaxHighlighterAdapter(adapter)
     }
   }
@@ -394,8 +389,7 @@ impl BrokenLinkCallback {
   #[wasm_bindgen(unchecked_return_type = "Option<ResolvedReference>")]
   pub fn call(
     &self,
-    #[wasm_bindgen(js_name = "thisArg")]
-    this: JsValue,
+    #[wasm_bindgen(js_name = "thisArg")] this: JsValue,
     #[wasm_bindgen(unchecked_param_type = "BrokenLinkReference")]
     reference: JsValue,
   ) -> Result<JsValue, JsValue> {
@@ -493,6 +487,108 @@ impl ComrakURLRewriter for URLRewriter {
   }
 }
 
+struct CodefenceRenderer(Function);
+
+unsafe impl Send for CodefenceRenderer {}
+unsafe impl Sync for CodefenceRenderer {}
+
+impl comrak::adapters::CodefenceRendererAdapter for CodefenceRenderer {
+  fn write(
+    &self,
+    out: &mut dyn std::fmt::Write,
+    lang: &str,
+    meta: &str,
+    code: &str,
+    sourcepos: Option<Sourcepos>,
+  ) -> std::fmt::Result {
+    let sourcepos = to_value(&sourcepos).map_err(|_| std::fmt::Error)?;
+    let args = js_sys::Array::new();
+    for value in [
+      lang.into(),
+      meta.into(),
+      code.into(),
+      sourcepos,
+    ] {
+      args.push(&value);
+    }
+    let result = self
+      .0
+      .apply(&JsValue::NULL, &args)
+      .map_err(|_| std::fmt::Error)?;
+    out.write_str(&result.as_string().ok_or(std::fmt::Error)?)
+  }
+}
+
+fn codefence_renderers(
+  options: Option<&Object>,
+) -> Result<HashMap<String, CodefenceRenderer>, JsValue> {
+  let mut value: JsValue =
+    options.cloned().map(Into::into).unwrap_or(JsValue::NULL);
+  for key in [
+    "plugins",
+    "render",
+    "codefenceRenderers",
+  ] {
+    if !value.is_object() {
+      return Ok(HashMap::new());
+    }
+    value = js_sys::Reflect::get(&value, &key.into())?;
+  }
+  if !value.is_object() {
+    return Ok(HashMap::new());
+  }
+  let mut renderers = HashMap::new();
+  for entry in Object::entries(&Object::from(value)).iter() {
+    let pair = js_sys::Array::from(&entry);
+    let name = pair.get(0).as_string().unwrap();
+    let function = pair
+      .get(1)
+      .dyn_into::<Function>()
+      .map_err(|_| TypeError::new("codefence renderer must be a function"))?;
+    renderers.insert(name, CodefenceRenderer(function));
+  }
+  Ok(renderers)
+}
+
+fn should_cancel(
+  options: Option<&Object>,
+) -> Result<Option<Function>, JsValue> {
+  let Some(options) = options else {
+    return Ok(None);
+  };
+  let parse = js_sys::Reflect::get(options, &"parse".into())?;
+  if !parse.is_object() {
+    return Ok(None);
+  }
+  let callback = js_sys::Reflect::get(&parse, &"shouldCancel".into())?;
+  if callback.is_null() || callback.is_undefined() {
+    return Ok(None);
+  }
+  callback
+    .dyn_into::<Function>()
+    .map(Some)
+    .map_err(|_| TypeError::new("shouldCancel must be a function").into())
+}
+
+fn parse_with_cancellation<'a>(
+  arena: &'a Arena<'a>,
+  md: &str,
+  options: &ComrakOptions,
+  should_cancel: Option<&Function>,
+) -> Result<&'a AstNode<'a>, JsValue> {
+  match should_cancel {
+    | Some(callback) => comrak::try_parse_document(arena, md, options, &|| {
+      callback
+        .call0(&JsValue::NULL)
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    })
+    .map_err(map_err),
+    | None => Ok(comrak::parse_document(arena, md, options)),
+  }
+}
+
 macro_rules! collect_options {
   (
     $options:ident,
@@ -553,6 +649,8 @@ macro_rules! markdown_to_fn {
       #[wasm_bindgen(unchecked_param_type = "Option<URLRewriterFunction>")]
       link_url_rewriter: Option<Function>,
     ) -> Result<String, JsValue> {
+      let should_cancel = should_cancel(options.as_ref())?;
+      let renderers = codefence_renderers(options.as_ref())?;
       let mut options: ComrakOptions = unwrap_option_object(options)?;
       collect_options!(
         options,
@@ -567,7 +665,10 @@ macro_rules! markdown_to_fn {
         heading_adapter,
       );
       let arena = Arena::new();
-      let ast = comrak::parse_document(&arena, md, &options);
+      let ast = parse_with_cancellation(&arena, md, &options, should_cancel.as_ref())?;
+      plugins.render.codefence_renderers = renderers.iter().map(|(name, renderer)| {
+        (name.clone(), renderer as &dyn comrak::adapters::CodefenceRendererAdapter)
+      }).collect();
       let mut out = String::new();
       comrak::$fn(ast, &options, &mut out, &plugins).map_err(map_err)?;
       Ok(out)
@@ -602,6 +703,7 @@ macro_rules! format_fn {
       #[wasm_bindgen(unchecked_param_type = "Option<URLRewriterFunction>")]
       link_url_rewriter: Option<Function>,
     ) -> Result<String, JsValue> {
+      let renderers = codefence_renderers(options.as_ref())?;
       let mut options: ComrakOptions = unwrap_option_object(options)?;
       collect_options!(
         options,
@@ -615,6 +717,9 @@ macro_rules! format_fn {
         codefence_syntax_highlighter,
         heading_adapter,
       );
+      plugins.render.codefence_renderers = renderers.iter().map(|(name, renderer)| {
+        (name.clone(), renderer as &dyn comrak::adapters::CodefenceRendererAdapter)
+      }).collect();
       let mut out = String::new();
       let root: &AstNode = from_value(ast.into()).map_err(map_err)?;
       comrak::$fn(root, &options, &mut out, &plugins).map_err(map_err)?;
@@ -629,20 +734,27 @@ fn map_err<T: ToString>(e: T) -> JsValue {
   TypeError::new(&e.to_string()).into()
 }
 
-fn unwrap_option_object<T: for<'de> Deserialize<'de> + Default>(
+fn unwrap_option_object(
   obj: Option<Object>,
-) -> Result<T, JsValue> {
-  if let Some(o) = obj {
-    if o.is_undefined() || o.is_null() || !o.is_object() {
-      Ok(T::default())
-    } else {
-      from_value(o.into()).map_err(map_err)
-    }
-  } else {
-    Ok(T::default())
+) -> Result<ComrakOptions<'static>, JsValue> {
+  let Some(obj) = obj else {
+    return Ok(ComrakOptions::default());
+  };
+  if obj.is_undefined() || obj.is_null() || !obj.is_object() {
+    return Ok(ComrakOptions::default());
   }
+  let mut options: ComrakOptions =
+    from_value(obj.clone().into()).map_err(map_err)?;
+  let extension = js_sys::Reflect::get(&obj, &"extension".into())?;
+  if extension.is_object() {
+    let prefix = js_sys::Reflect::get(&extension, &"headerIdPrefix".into())?;
+    if prefix.is_undefined() {
+      options.extension.header_id_prefix =
+        js_sys::Reflect::get(&extension, &"headerIDs".into())?.as_string();
+    }
+  }
+  Ok(options)
 }
-
 
 /// Returns the version of Comrak used in this build, as a string.
 #[wasm_bindgen]
@@ -688,6 +800,7 @@ pub fn parse_document(
   #[wasm_bindgen(unchecked_param_type = "Option<URLRewriterFunction>")]
   link_url_rewriter: Option<Function>,
 ) -> Result<JsValue, JsValue> {
+  let should_cancel = should_cancel(options.as_ref())?;
   let mut options: ComrakOptions = unwrap_option_object(options)?;
   collect_options!(
     options,
@@ -696,7 +809,8 @@ pub fn parse_document(
     link_url_rewriter,
   );
   let arena = Arena::new();
-  let root = comrak::parse_document(&arena, md, &options);
+  let root =
+    parse_with_cancellation(&arena, md, &options, should_cancel.as_ref())?;
   to_value(&root).map_err(map_err)
 }
 

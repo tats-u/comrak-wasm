@@ -5,6 +5,7 @@
  *
  * @module options
  */
+import type { CodefenceRenderer } from "./adapters.ts";
 import type { HeadingAdapter, SyntaxHighlighterAdapter } from "./adapters.ts";
 import { cloneDeep, type RequiredDeep } from "./_internal.ts";
 
@@ -166,6 +167,71 @@ export interface Options {
  * @tags extension
  */
 export interface ExtensionOptions {
+  /** Prefix for heading IDs; enables heading anchors.
+   * @default {null}
+   */
+  headerIdPrefix?: string | null;
+
+  /** Include the heading ID prefix in anchor hrefs.
+   * @default {false}
+   */
+  headerIdPrefixInHref?: boolean;
+
+  /** Enable Obsidian callouts, including titles and folding.
+   * @default {false}
+   */
+  ofmCallouts?: boolean;
+
+  /** Enable LaTeX math delimiters: \\(…\\) and \\[…\\].
+   * @default {false}
+   */
+  mathLatex?: boolean;
+
+  /** Leave ![[embed]] wikilinks as literal text.
+   * @default {false}
+   */
+  wikilinksIgnoreEmbeds?: boolean;
+
+  /** Enable hidden Obsidian %%comments%%.
+   * @default {false}
+   */
+  ofmComments?: boolean;
+
+  /** Enable ++inserted text++.
+   * @default {false}
+   */
+  insert?: boolean;
+
+  /** Enable Phoenix HEEx template syntax.
+   * @default {false}
+   */
+  phoenixHeex?: boolean;
+
+  /** Enable :::name container blocks.
+   * @default {false}
+   */
+  blockDirective?: boolean;
+
+  /** Parse attributes on headings.
+   * @default {false}
+   */
+  headerAttributes?: boolean;
+
+  /** Parse attributes on fenced code blocks.
+   * @default {false}
+   */
+  fencedCodeAttributes?: boolean;
+
+  /** Parse attributes on inline code.
+   * @default {false}
+   */
+  inlineCodeAttributes?: boolean;
+
+  /** Parse attributes on links and images.
+   * @default {false}
+   */
+  linkAttributes?: boolean;
+
   /**
    * Enables the [autolink extension] from the GFM spec.
    *
@@ -284,9 +350,10 @@ export interface ExtensionOptions {
    * const html = markdownToHTML("# README\n", {
    *   extension: { headerIDs: "user-content-" },
    * });
-   * assert.equal(html, "<h1><a href=\"#readme\" aria-hidden=\"true\" class=\"anchor\" id=\"user-content-readme\"></a>README</h1>\n");
+   * assert.equal(html, "<h1 id=\"user-content-readme\">README<a href=\"#readme\" aria-label=\"Link to heading 'README'\" data-heading-content=\"README\" class=\"anchor\"></a></h1>\n");
    * ```
    * @default {null}
+   * @deprecated Use headerIdPrefix.
    */
   headerIDs?: string | null;
 
@@ -326,6 +393,7 @@ export interface ExtensionOptions {
    * assert.equal(html, "<p>Hello &lt;xmp>.</p>\n&lt;xmp>\n");
    * ```
    * @default {false}
+   * @deprecated Legacy compatibility extension; upstream removed this option in 0.56.
    */
   tagfilter?: boolean;
 
@@ -683,6 +751,18 @@ export interface ExtensionOptions {
  */
 export interface ParseOptions {
   /**
+   * Return true to cancel parsing. Called periodically during synchronous parsing.
+   * Cancellation throws a TypeError. Use this for deadlines or shared cancellation
+   * flags; callbacks cannot process event-loop events while parsing runs.
+   */
+  shouldCancel?: (() => boolean) | null;
+
+  /** Count source columns in Unicode characters instead of bytes.
+   * @default {false}
+   */
+  sourceposChars?: boolean;
+
+  /**
    * The default info string for fenced code blocks.
    *
    * @example
@@ -863,6 +943,16 @@ export interface ParseOptions {
  * @tags render
  */
 export interface RenderOptions {
+  /** Choose GitHub div alerts or semantic aside elements.
+   * @default {"specific"}
+   */
+  alertStyle?: "specific" | "semantic";
+
+  /** Remove optional newlines between HTML block tags.
+   * @default {false}
+   */
+  compactHtml?: boolean;
+
   /**
    * Escape raw HTML instead of clobbering it.
    *
@@ -1122,6 +1212,8 @@ export interface RenderOptions {
  * @tags render, plugins
  */
 export interface RenderPlugins {
+  /** Render entire fenced blocks by language name. */
+  codefenceRenderers?: Record<string, CodefenceRenderer>;
   /** Adapter for syntax highlighting codefences. */
   codefenceSyntaxHighlighter?: SyntaxHighlighterAdapter | null;
   /** Adapter for customizing heading rendering. */
@@ -1149,6 +1241,19 @@ export interface Plugins {
  */
 export const defaultOptions: DefaultOptions = {
   extension: {
+    headerIdPrefix: null,
+    headerIdPrefixInHref: false,
+    ofmCallouts: false,
+    mathLatex: false,
+    wikilinksIgnoreEmbeds: false,
+    ofmComments: false,
+    insert: false,
+    phoenixHeex: false,
+    blockDirective: false,
+    headerAttributes: false,
+    fencedCodeAttributes: false,
+    inlineCodeAttributes: false,
+    linkAttributes: false,
     autolink: false,
     descriptionLists: false,
     footnotes: false,
@@ -1178,6 +1283,8 @@ export const defaultOptions: DefaultOptions = {
     highlight: false,
   },
   parse: {
+    shouldCancel: null,
+    sourceposChars: false,
     defaultInfoString: null,
     smart: false,
     relaxedTasklistMatching: false,
@@ -1189,6 +1296,8 @@ export const defaultOptions: DefaultOptions = {
     escapedCharSpans: false,
   },
   render: {
+    alertStyle: "specific",
+    compactHtml: false,
     escape: false,
     githubPreLang: false,
     hardbreaks: false,
@@ -1208,6 +1317,7 @@ export const defaultOptions: DefaultOptions = {
   },
   plugins: {
     render: {
+      codefenceRenderers: {},
       codefenceSyntaxHighlighter: null,
       headingAdapter: null,
     },

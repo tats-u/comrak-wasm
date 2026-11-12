@@ -7,11 +7,6 @@ import { parse as parseVersion } from "jsr:@std/semver@1.0.7/parse";
 import type { SemVer } from "jsr:@std/semver@1.0.7/types";
 import process from "node:process";
 
-const wasm = await import(
-  // prevent static analysis in case the file doesn't exist yet
-  "../lib/comrak_wasm.js" + ""
-).catch(() => ({} as never));
-
 /**
  * Helper function for determining the version of comrak used in this build,
  * allowing us to adjust our expected test outputs accordingly to account for
@@ -30,13 +25,6 @@ export function parseComrakVersion(
   path?: string,
   fallback: string | SemVer | null | undefined = "0.0.0",
 ): SemVer {
-  // newer versions of this project will expose a version function
-  if ("version" in wasm && typeof wasm.version === "function") {
-    return parseVersion(wasm.version());
-  }
-
-  // but if the version() bindings are unavailable, we'll fallback to parsing
-  // the project's Cargo.toml file to extract the dependency version directly
   const toml = Deno.readTextFileSync(path || "./Cargo.toml");
   const version = toml.match(
     /(?<=comrak\s*=\s*(?:\{[^}]*?\bversion\s*=\s*)?)"(.*?)"/,
@@ -58,7 +46,7 @@ export function parseComrakVersion(
 /**
  * Indicates whether this is a "legacy" build of comrak-wasm, meaning it relies
  * on a version of comrak older than 0.20.0 (at the time of writing the latest
- * release is 0.48.0).
+ * release is 0.59.0).
  *
  * @internal
  */
